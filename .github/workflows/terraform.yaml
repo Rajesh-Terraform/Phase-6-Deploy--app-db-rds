@@ -1,4 +1,5 @@
-name: Phase 6 - App and RDS apply 
+
+name: Phase 6 - app-db-rds-destroy   successful destroy phase6-app-db-rds 16/9/26
 
 on:
   push:
@@ -12,37 +13,267 @@ permissions:
   contents: read
 
 jobs:
-  terraform:
+  cleanup:
     runs-on: ubuntu-latest
 
-    env:
-      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::434097521299:role/testingdummy
+          role-to-assume: arn:aws:iam::434097521299:role/testingdummy 
           aws-region: ap-south-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      # --------------------------------------------------
+      # 1. Delete RDS
+      # --------------------------------------------------
+      - name: Delete Phase 6 RDS
+        shell: bash
+        run: |
+          DB_ID="phase6-postgres"
 
-      - name: terraform init -reconfigure  
-        run: terraform init
+          if aws rds describe-db-instances \
+            --db-instance-identifier "$DB_ID" \
+            --region ap-south-1 >/dev/null 2>&1; then
 
-      - name: Terraform Format
-        run: terraform fmt 
+            echo "Deleting RDS: $DB_ID"
 
-      - name: Terraform Validate
-        run: terraform validate
+            aws rds delete-db-instance \
+              --db-instance-identifier "$DB_ID" \
+              --skip-final-snapshot \
+              --delete-automated-backups \
+              --region ap-south-1
 
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
+            echo "Waiting for RDS deletion..."
 
-      - name: Terraform Apply 
-        run: terraform apply -auto-approve tfplan  
+            aws rds wait db-instance-deleted \
+              --db-instance-identifier "$DB_ID" \
+              --region ap-south-1
 
+          else
+            echo "RDS $DB_ID not found"
+          fi
+
+      # --------------------------------------------------
+      # 2. Delete Phase 6 EC2 instances
+      # --------------------------------------------------
+      - name: Delete Phase 6 EC2
+        shell: bash
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --region ap-south-1 \
+            --filters \
+              "Name=vpc-id,Values=vpc-012c100251b60e49c" \
+              "Name=tag:Name,Values=phase6-private-app" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            echo "Terminating: $INSTANCE_IDS"
+
+            aws ec2 terminate-instances \
+              --instance-ids $INSTANCE_IDS \
+              --region ap-south-1
+
+            aws ec2 wait instance-terminated \
+              --instance-ids $INSTANCE_IDS \
+              --region ap-south-1
+          else
+            echo "Phase 6 EC2 not found"
+          fi
+
+      # --------------------------------------------------
+      # 3. Delete VPC Endpoints
+      # --------------------------------------------------
+      - name: Delete Phase 6 VPC Endpoints
+        shell: bash
+        run: |
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region ap-south-1 \
+            --filters \
+              "Name=vpc-id,Values=vpc-012c100251b60e49c" \
+            --query "VpcEndpoints[?contains(Tags[?Key=='Name'].Value | [0], 'phase6-')].VpcEndpointId" \
+            --output text)
+
+          if [ -n "$ENDPOINT_IDS" ] && [ "$ENDPOINT_IDS" != "None" ]; then
+            echo "Deleting Phase 6 VPC endpoints:"
+            echo "$ENDPOINT_IDS"
+
+            aws ec2 delete-vpc-endpoints \
+              --vpc-endpoint-ids $ENDPOINT_IDS \
+              --region ap-south-1
+          else
+            echo "Phase 6 VPC endpoints not found"
+          fi
+
+      # --------------------------------------------------
+      # 4. Wait for ENIs from VPC endpoints
+      # --------------------------------------------------
+      - name: Wait for endpoint cleanup
+        shell: bash
+        run: |
+          echo "Waiting 30 seconds for endpoint ENIs to disappear..."
+          sleep 30
+
+      # --------------------------------------------------
+      # 5. Delete DB subnet group
+      # --------------------------------------------------
+      - name: Delete Phase 6 DB subnet group
+        shell: bash
+        run: |
+          SUBNET_GROUP="phase6-db-subnet-group"
+
+          if aws rds describe-db-subnet-groups \
+            --db-subnet-group-name "$SUBNET_GROUP" \
+            --region ap-south-1 >/dev/null 2>&1; then
+
+            echo "Deleting DB subnet group: $SUBNET_GROUP"
+
+            aws rds delete-db-subnet-group \
+              --db-subnet-group-name "$SUBNET_GROUP" \
+              --region ap-south-1
+          else
+            echo "DB subnet group not found"
+          fi
+
+      # --------------------------------------------------
+      # 6. Delete security groups
+      # --------------------------------------------------
+      - name: Delete Phase 6 Security Groups
+        shell: bash
+        run: |
+          VPC_ID="vpc-012c100251b60e49c"
+
+          for SG_NAME in \
+            phase6-app-sg \
+            phase6-db-sg \
+            phase6-endpoints-sg
+          do
+
+            SG_ID=$(aws ec2 describe-security-groups \
+              --region ap-south-1 \
+              --filters \
+                "Name=vpc-id,Values=$VPC_ID" \
+                "Name=group-name,Values=$SG_NAME" \
+              --query "SecurityGroups[0].GroupId" \
+              --output text)
+
+            if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+              echo "Deleting $SG_NAME: $SG_ID"
+
+              aws ec2 delete-security-group \
+                --group-id "$SG_ID" \
+                --region ap-south-1 || true
+            else
+              echo "$SG_NAME not found"
+            fi
+          done
+
+      # --------------------------------------------------
+      # 7. Delete IAM instance profile
+      # --------------------------------------------------
+      - name: Delete Phase 6 IAM Instance Profile
+        shell: bash
+        run: |
+          PROFILE="phase6-ssm-profile"
+
+          if aws iam get-instance-profile \
+            --instance-profile-name "$PROFILE" >/dev/null 2>&1; then
+
+            echo "Removing role from instance profile..."
+
+            aws iam remove-role-from-instance-profile \
+              --instance-profile-name "$PROFILE" \
+              --role-name phase6-ssm-role || true
+
+            echo "Deleting instance profile..."
+
+            aws iam delete-instance-profile \
+              --instance-profile-name "$PROFILE"
+          else
+            echo "Instance profile not found"
+          fi
+
+      # --------------------------------------------------
+      # 8. Detach SSM policy
+      # --------------------------------------------------
+      - name: Detach SSM policy
+        shell: bash
+        run: |
+          aws iam detach-role-policy \
+            --role-name phase6-ssm-role \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore \
+            || true
+
+      # --------------------------------------------------
+      # 9. Delete IAM role
+      # --------------------------------------------------
+      - name: Delete Phase 6 SSM Role
+        shell: bash
+        run: |
+          if aws iam get-role \
+            --role-name phase6-ssm-role >/dev/null 2>&1; then
+
+            echo "Deleting IAM role: phase6-ssm-role"
+
+            aws iam delete-role \
+              --role-name phase6-ssm-role
+          else
+            echo "IAM role not found"
+          fi
+
+      # --------------------------------------------------
+      # 10. Final verification
+      # --------------------------------------------------
+      - name: Verify Phase 6 resources
+        shell: bash
+        run: |
+          echo "===================================="
+          echo "Phase 6 cleanup verification"
+          echo "===================================="
+
+          echo ""
+          echo "RDS:"
+          aws rds describe-db-instances \
+            --region ap-south-1 \
+            --query "DBInstances[?DBInstanceIdentifier=='phase6-postgres'].[DBInstanceIdentifier,DBInstanceStatus]" \
+            --output table || true
+
+          echo ""
+          echo "EC2:"
+          aws ec2 describe-instances \
+            --region ap-south-1 \
+            --filters \
+              "Name=vpc-id,Values=vpc-012c100251b60e49c" \
+              "Name=tag:Name,Values=phase6-private-app" \
+            --query "Reservations[].Instances[].[InstanceId,State.Name]" \
+            --output table
+
+          echo ""
+          echo "VPC Endpoints:"
+          aws ec2 describe-vpc-endpoints \
+            --region ap-south-1 \
+            --filters \
+              "Name=vpc-id,Values=vpc-012c100251b60e49c" \
+            --query "VpcEndpoints[?contains(Tags[?Key=='Name'].Value | [0], 'phase6-')].[VpcEndpointId,ServiceName,State]" \
+            --output table
+
+          echo ""
+          echo "Security Groups:"
+          aws ec2 describe-security-groups \
+            --region ap-south-1 \
+            --filters \
+              "Name=vpc-id,Values=vpc-012c100251b60e49c" \
+            --query "SecurityGroups[?starts_with(GroupName,'phase6-')].[GroupId,GroupName]" \
+            --output table || true
+
+          echo ""
+          echo "IAM Role:"
+          aws iam get-role \
+            --role-name phase6-ssm-role \
+            --query "Role.RoleName" \
+            --output text || echo "phase6-ssm-role deleted"
+
+          echo ""
+          echo "===================================="
+          echo "Cleanup finished"
+          echo "===================================="  
