@@ -132,7 +132,7 @@ resource "aws_instance" "app" {
 # -------------------------
 
 resource "aws_db_subnet_group" "this" {
-  name = "phase6-db-subnet-group"
+  name = "phase6-db-subnet-group" 
 
   subnet_ids = var.private_subnet_ids
 
@@ -299,4 +299,4 @@ resource "aws_vpc_endpoint" "s3" {
   tags = {
     Name = "phase6-s3-endpoint"
   }
-}  
+}    
